@@ -12,9 +12,9 @@ parser.add_argument("--data", help="number of training data", default=1000)
 parser.add_argument("--dataTest", help="number of test data", default=4000)
 parser.add_argument("--gpu", help="gpu index", default="0")
 parser.add_argument("--embSize", help="embedding size of GNN", default="64")
-parser.add_argument("--type", help="what's the type of the model", default="obj", choices=['fea','obj','sol'])
+parser.add_argument("--type", help="what's the type of the model", default="sol", choices=['fea','obj','sol'])
 parser.add_argument("--set", help="which set you want to test on?", default="test", choices=['test','train'])
-parser.add_argument("--loss", help="loss function used in testing", default="fea", choices=['mse','l2'])
+parser.add_argument("--loss", help="loss function used in testing", default="l2", choices=['mse','l2'])
 args = parser.parse_args()
 
 ## FUNCTION OF TESTING
@@ -26,10 +26,22 @@ def process(model, dataloader, type='fea', loss='mse', n_Vars_small=50):
     return_err = None
     
     if type == "fea":
-        errs_fp = np.sum((logits.numpy() > 0.5) & (cand_scores.numpy() < 0.5))
-        errs_fn = np.sum((logits.numpy() < 0.5) & (cand_scores.numpy() > 0.5))
-        errs = errs_fp + errs_fn
-        return_err = errs / cand_scores.shape[0]
+        logits_np = logits.numpy().flatten()
+        cand_scores_np = cand_scores.numpy().flatten()
+        pred_labels = (logits_np > 0.5).astype(int)
+        true_labels = (cand_scores_np > 0.5).astype(int)
+        tp = np.sum((pred_labels == 1) & (true_labels == 1))
+        tn = np.sum((pred_labels == 0) & (true_labels == 0))
+        fp = np.sum((pred_labels == 1) & (true_labels == 0))
+        fn = np.sum((pred_labels == 0) & (true_labels == 1))
+        try:
+            from sklearn.metrics import roc_auc_score
+            auc = roc_auc_score(true_labels, logits_np)
+        except ImportError:
+            auc = None
+        err_rate = (fp + fn) / cand_scores_np.shape[0]
+        return_err = err_rate
+        return return_err, auc, tp, tn, fp, fn
     
     if type == "obj":
         if loss == 'mse':

@@ -7,18 +7,38 @@ from qp_models import QPGNNPolicy
 
 ## ARGUMENTS OF THE SCRIPT
 parser = argparse.ArgumentParser()
-parser.add_argument("--data", help="number of training data", default=2000, type=int)
+parser.add_argument("--data", help="number of training data", default=1000, type=int)
 parser.add_argument("--gpu", help="gpu index", default="0")
 parser.add_argument("--embSize", help="embedding size of GNN", default=64, type=int)
-parser.add_argument("--epoch", help="max number of epochs", default=1000, type=int)
+parser.add_argument("--epoch", help="max number of epochs", default=500, type=int)
 parser.add_argument("--type", help="model type", default="fea", choices=['fea','obj','sol'])
 parser.add_argument("--valSplit", help="fraction of data for validation (0~1)", default=0.2, type=float)
 parser.add_argument("--dropout", help="dropout rate", default=0.0, type=float)
 parser.add_argument("--weightDecay", help="weight decay for AdamW", default=0.0, type=float)
-parser.add_argument("--patience", help="early stopping patience", default=40, type=int)
+parser.add_argument("--patience", help="early stopping patience", default=300, type=int)
 args = parser.parse_args()
 
 ## HELPER FUNCTIONS
+def relative_loss(y_true, y_pred):
+    """
+    Göreceli mutlak hata: |y_true - y_pred| / (|y_true| + epsilon)
+    Büyük objektif değerleri için daha dengeli bir eğitim sağlar.
+    """
+    epsilon = 1.0  # Sıfıra bölmeyi önlemek için
+    return tf.reduce_mean(tf.abs(y_true - y_pred) / (tf.abs(y_true) + epsilon))
+
+def normalized_euclidean_loss(y_true, y_pred, n_Vars_small=50):
+    """
+    Normalize edilmiş Euclidean mesafe loss fonksiyonu.
+    Çözüm vektörlerinin tahmininde daha anlamlı bir metrik.
+    """
+    batch_size = tf.shape(y_true)[0] // n_Vars_small
+    y_true_reshaped = tf.reshape(y_true, [batch_size, n_Vars_small])
+    y_pred_reshaped = tf.reshape(y_pred, [batch_size, n_Vars_small])
+    distances = tf.math.reduce_euclidean_norm(y_true_reshaped - y_pred_reshaped, axis=1)
+    norms = tf.math.reduce_euclidean_norm(y_true_reshaped, axis=1) + 1.0
+    return tf.reduce_mean(distances / norms)
+
 def process_train_step(model, dataloader, optimizer, type='fea'):
     c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm, cand_scores = dataloader
     batched_states = (c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm)
@@ -26,8 +46,18 @@ def process_train_step(model, dataloader, optimizer, type='fea'):
     with tf.GradientTape() as tape:
         # training=True => Dropout active
         logits = model(batched_states, training=True)
-        loss_tensor = tf.keras.metrics.mean_squared_error(cand_scores, logits)
-        loss = tf.reduce_mean(loss_tensor)
+        
+        # Farklı model tipleri için farklı loss fonksiyonları
+        if type == "obj":
+            # Objektif için göreceli loss
+            loss = relative_loss(cand_scores, logits)
+        elif type == "sol":
+            # Çözüm için normalize edilmiş Euclidean loss
+            loss = normalized_euclidean_loss(cand_scores, logits, n_Vars_small=n_vsm)
+        else:
+            # fea ve sol için MSE kullanmaya devam et
+            loss_tensor = tf.keras.metrics.mean_squared_error(cand_scores, logits)
+            loss = tf.reduce_mean(loss_tensor)
     
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
@@ -50,8 +80,18 @@ def process_eval(model, dataloader, type='fea'):
     
     # training=False => Dropout inactive
     logits = model(batched_states, training=False)
-    loss_tensor = tf.keras.metrics.mean_squared_error(cand_scores, logits)
-    loss = tf.reduce_mean(loss_tensor)
+    
+    # Farklı model tipleri için farklı loss fonksiyonları
+    if type == "obj":
+        # Objektif için göreceli loss
+        loss = relative_loss(cand_scores, logits)
+    elif type == "sol":
+        # Çözüm için normalize edilmiş Euclidean loss
+        loss = normalized_euclidean_loss(cand_scores, logits, n_Vars_small=n_vsm)
+    else:
+        # fea ve sol için MSE kullanmaya devam et
+        loss_tensor = tf.keras.metrics.mean_squared_error(cand_scores, logits)
+        loss = tf.reduce_mean(loss_tensor)
 
     err_rate = None
     if type == "fea":
@@ -82,6 +122,7 @@ n_Vars_small = 50   # Each QP has 50 variables
 n_Eles_small = 100  # Each QP has 100 nonzeros in matrix A
 
 ## LOAD DATASET INTO MEMORY
+## VERI ÖNIŞLEME (OPSIYONEL - OBJ MODELI IÇIN)
 if args.type == "fea":
     varFeatures_all = read_csv(trainfolder + "VarFeatures_all.csv", header=None).values[:n_Vars_small * n_Samples_total,:]
     conFeatures_all = read_csv(trainfolder + "ConFeatures_all.csv", header=None).values[:n_Cons_small * n_Samples_total,:]
@@ -100,7 +141,7 @@ elif args.type == "obj":
     qedgIndices_all = read_csv(trainfolder + "QEdgeIndices_feas.csv", header=None).values
     labels_all = read_csv(trainfolder + "Labels_obj.csv", header=None).values[:n_Samples_total,:]
 
-elif args.type == "sol":
+    elif args.type == "sol":
     varFeatures_all = read_csv(trainfolder + "VarFeatures_feas.csv", header=None).values[:n_Vars_small * n_Samples_total,:]
     conFeatures_all = read_csv(trainfolder + "ConFeatures_feas.csv", header=None).values[:n_Cons_small * n_Samples_total,:]
     edgFeatures_all = read_csv(trainfolder + "EdgeFeatures_feas.csv", header=None).values[:n_Eles_small * n_Samples_total,:]
@@ -167,6 +208,20 @@ elif args.type == "sol":
     qedgFeatures_val = qedgFeatures_all
     qedgIndices_val = qedgIndices_all
 
+# Check for empty validation arrays and raise a clear error if found
+if (varFeatures_val.shape[0] == 0 or conFeatures_val.shape[0] == 0 or
+    edgFeatures_val.shape[0] == 0 or edgIndices_val.shape[0] == 0 or
+    labels_val.shape[0] == 0):
+    print('ERROR: One or more validation arrays are empty!')
+    print('varFeatures_val:', varFeatures_val.shape)
+    print('conFeatures_val:', conFeatures_val.shape)
+    print('edgFeatures_val:', edgFeatures_val.shape)
+    print('edgIndices_val:', edgIndices_val.shape)
+    print('labels_val:', labels_val.shape)
+    print('This usually means your --data is too small or --valSplit is too low.')
+    print('Please increase your dataset size or validation split.')
+    exit(1)
+
 ## SETUP MODEL AND SAVED MODEL PATH
 if not os.path.exists('./saved-models/'):
     os.makedirs('./saved-models/')
@@ -198,6 +253,16 @@ with tf.device("GPU:" + str(gpu_index) if len(gpus) > 0 else "/CPU:0"):
         conFeatures_train.shape[0], varFeatures_train.shape[0],
         n_Cons_small, n_Vars_small, labels_train_tf
     )
+
+    # Debug: Print shapes of validation arrays before converting to tensors
+    print('Validation data shapes:')
+    print('  varFeatures_val:', varFeatures_val.shape)
+    print('  conFeatures_val:', conFeatures_val.shape)
+    print('  edgFeatures_val:', edgFeatures_val.shape)
+    print('  edgIndices_val:', edgIndices_val.shape)
+    print('  qedgFeatures_val:', qedgFeatures_val.shape)
+    print('  qedgIndices_val:', qedgIndices_val.shape)
+    print('  labels_val:', labels_val.shape)
 
     varFeatures_val_tf = tf.constant(varFeatures_val, dtype=tf.float32)
     conFeatures_val_tf = tf.constant(conFeatures_val, dtype=tf.float32)
