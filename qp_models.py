@@ -8,7 +8,6 @@ class BipartiteGraphConvolution(K.Model):
     """
     Partial bipartite graph convolution (either left-to-right or right-to-left).
     """
-
     def __init__(self, emb_size, activation, initializer, right_to_left=False):
         super().__init__()
         
@@ -49,7 +48,6 @@ class BipartiteGraphConvolution(K.Model):
         self.built = True
     
     def call(self, inputs):
-    
         left_features, edge_indices, edge_features, right_features, scatter_out_size = inputs
 
         if self.right_to_left:
@@ -62,16 +60,16 @@ class BipartiteGraphConvolution(K.Model):
         # compute joint features
         if scatter_dim == 0:
             joint_features = self.feature_module_edge(edge_features) * tf.gather(
-                    self.feature_module_right(right_features),
-                    axis=0,
-                    indices=edge_indices[1]
-                )
+                self.feature_module_right(right_features),
+                axis=0,
+                indices=edge_indices[1]
+            )
         else:
             joint_features = self.feature_module_edge(edge_features) * tf.gather(
-                    self.feature_module_left(left_features),
-                    axis=0,
-                    indices=edge_indices[0]
-                )
+                self.feature_module_left(left_features),
+                axis=0,
+                indices=edge_indices[0]
+            )
 
         # perform convolution
         conv_output = tf.scatter_nd(
@@ -81,10 +79,7 @@ class BipartiteGraphConvolution(K.Model):
         )
 
         # combine with previous features
-        output = self.output_module(tf.concat([
-            conv_output,
-            prev_features,
-        ], axis=1))
+        output = self.output_module(tf.concat([conv_output, prev_features], axis=1))
 
         return output
 
@@ -93,7 +88,6 @@ class VariableToVariableConvolution(K.Model):
     """
     Variable-to-variable convolution for quadratic term interactions
     """
-    
     def __init__(self, emb_size, activation, initializer):
         super().__init__()
         
@@ -147,10 +141,7 @@ class VariableToVariableConvolution(K.Model):
         )
         
         # Combine with original features
-        output = self.output_module(tf.concat([
-            conv_output,
-            var_features,
-        ], axis=1))
+        output = self.output_module(tf.concat([conv_output, var_features], axis=1))
         
         return output
 
@@ -158,9 +149,19 @@ class VariableToVariableConvolution(K.Model):
 class QPGNNPolicy(K.Model):
     """
     Graph Convolutional Neural Network model for Quadratic Programming (QP).
+    Supports optional node-level or graph-level outputs (isGraphLevel).
+    Includes optional dropout after each activation if training=True.
     """
-
-    def __init__(self, embSize, nConsF, nEdgeF, nVarF, nQEdgeF=1, isGraphLevel=True):
+    def __init__(
+        self,
+        embSize,
+        nConsF,
+        nEdgeF,
+        nVarF,
+        nQEdgeF=1,
+        isGraphLevel=True,
+        dropout_rate=0.0,
+    ):
         super().__init__()
 
         self.emb_size = embSize
@@ -169,11 +170,12 @@ class QPGNNPolicy(K.Model):
         self.var_nfeats = nVarF
         self.qedge_nfeats = nQEdgeF
         self.is_graph_level = isGraphLevel 
-        # "isGraphLevel == True" means the output is graph-level, each graph has an output value;
-        # Otherwise, each variable has an output value.
-
+        self.dropout_rate = dropout_rate
         self.activation = K.activations.relu
         self.initializer = K.initializers.Orthogonal()
+
+        # Dropout layer
+        self.dropout_layer = K.layers.Dropout(self.dropout_rate)
 
         # CONSTRAINT EMBEDDING
         self.cons_embedding = K.Sequential([
@@ -227,7 +229,6 @@ class QPGNNPolicy(K.Model):
         self.variables_topological_order = [v.name for v in self.variables]
     
     def build(self, input_shapes):
-        
         c_shape, ei_shape, ev_shape, v_shape, qi_shape, qv_shape, nc_shape, nv_shape = input_shapes
         emb_shape = [None, self.emb_size]
 
@@ -255,8 +256,11 @@ class QPGNNPolicy(K.Model):
                 
             self.built = True
 
-    def call(self, inputs, training):
-        
+    def call(self, inputs, training=False):
+        """
+        Process a QP instance through the GNN.
+        If training=True, dropout is activated.
+        """
         constraint_features, edge_indices, edge_features, variable_features, \
         qedge_indices, qedge_features, n_cons_total, n_vars_total, n_cons_small, n_vars_small = inputs
 
@@ -266,49 +270,76 @@ class QPGNNPolicy(K.Model):
         qedge_features = self.qedge_embedding(qedge_features)
         variable_features = self.var_embedding(variable_features)
 
+        #----------------------------------------------------------------
         # FIRST LAYER OF CONVOLUTIONS
-        # Constraint-variable message passing
+        #----------------------------------------------------------------
+        # Constraint-Variable bipartite convolution
         constraint_features = self.conv_v_to_c((
             constraint_features, edge_indices, edge_features, variable_features, n_cons_total))
         constraint_features = self.activation(constraint_features)
+        # Apply dropout if in training mode
+        if training and self.dropout_rate > 0:
+            constraint_features = self.dropout_layer(constraint_features, training=training)
 
+        # Variable-Constraint bipartite convolution
         variable_features = self.conv_c_to_v((
             constraint_features, edge_indices, edge_features, variable_features, n_vars_total))
         variable_features = self.activation(variable_features)
+        if training and self.dropout_rate > 0:
+            variable_features = self.dropout_layer(variable_features, training=training)
         
-        # Variable-variable message passing (quadratic term)
+        # Variable-Variable convolution (for quadratic terms)
         variable_features = self.conv_v_to_v((
             variable_features, qedge_indices, qedge_features, n_vars_total))
         variable_features = self.activation(variable_features)
+        if training and self.dropout_rate > 0:
+            variable_features = self.dropout_layer(variable_features, training=training)
 
+        #----------------------------------------------------------------
         # SECOND LAYER OF CONVOLUTIONS
-        # Constraint-variable message passing
+        #----------------------------------------------------------------
+        # Constraint-Variable bipartite convolution
         constraint_features = self.conv_v_to_c2((
             constraint_features, edge_indices, edge_features, variable_features, n_cons_total))
         constraint_features = self.activation(constraint_features)
+        if training and self.dropout_rate > 0:
+            constraint_features = self.dropout_layer(constraint_features, training=training)
 
+        # Variable-Constraint bipartite convolution
         variable_features = self.conv_c_to_v2((
             constraint_features, edge_indices, edge_features, variable_features, n_vars_total))
         variable_features = self.activation(variable_features)
+        if training and self.dropout_rate > 0:
+            variable_features = self.dropout_layer(variable_features, training=training)
         
-        # Variable-variable message passing (quadratic term)
+        # Variable-Variable convolution (for quadratic terms)
         variable_features = self.conv_v_to_v2((
             variable_features, qedge_indices, qedge_features, n_vars_total))
         variable_features = self.activation(variable_features)
+        if training and self.dropout_rate > 0:
+            variable_features = self.dropout_layer(variable_features, training=training)
         
+        #----------------------------------------------------------------
         # OUTPUT LAYER
+        #----------------------------------------------------------------
         if self.is_graph_level:
-            # For graph-level prediction, pool node features
+            # Graph-level => pool variable & constraint features
             variable_features = tf.reshape(variable_features, [int(n_vars_total / n_vars_small), n_vars_small, self.emb_size])
             variable_features_mean = tf.reduce_mean(variable_features, axis=1)
+
             constraint_features = tf.reshape(constraint_features, [int(n_cons_total / n_cons_small), n_cons_small, self.emb_size])
             constraint_features_mean = tf.reduce_mean(constraint_features, axis=1)
-            final_features = tf.concat([variable_features_mean, constraint_features_mean], 1)
-        else:
-            # For node-level prediction, use variable features directly
-            final_features = variable_features
 
-        # Output
+            final_features = tf.concat([variable_features_mean, constraint_features_mean], 1)
+            # Dropout (optional)
+            if training and self.dropout_rate > 0:
+                final_features = self.dropout_layer(final_features, training=training)
+        else:
+            # Node-level => use variable_features directly
+            final_features = variable_features
+            if training and self.dropout_rate > 0:
+                final_features = self.dropout_layer(final_features, training=training)
+
         output = self.output_module(final_features)
         return output
         

@@ -1,4 +1,4 @@
-# This script tests the trained QP GNN models
+# Part 1 of QP GNN testing script
 import numpy as np
 from pandas import read_csv
 import tensorflow as tf
@@ -9,12 +9,12 @@ from qp_models import QPGNNPolicy
 ## ARGUMENTS OF THE SCRIPT
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", help="number of training data", default=1000)
-parser.add_argument("--dataTest", help="number of test data", default=1000)
+parser.add_argument("--dataTest", help="number of test data", default=4000)
 parser.add_argument("--gpu", help="gpu index", default="0")
 parser.add_argument("--embSize", help="embedding size of GNN", default="64")
-parser.add_argument("--type", help="what's the type of the model", default="fea", choices=['fea','obj','sol'])
-parser.add_argument("--set", help="which set you want to test on?", default="train", choices=['test','train'])
-parser.add_argument("--loss", help="loss function used in testing", default="mse", choices=['mse','l2'])
+parser.add_argument("--type", help="what's the type of the model", default="obj", choices=['fea','obj','sol'])
+parser.add_argument("--set", help="which set you want to test on?", default="test", choices=['test','train'])
+parser.add_argument("--loss", help="loss function used in testing", default="fea", choices=['mse','l2'])
 args = parser.parse_args()
 
 ## FUNCTION OF TESTING
@@ -63,7 +63,10 @@ n_Eles_small = 100 # Each QP has 100 nonzeros in matrix A
 ## SET-UP MODEL
 embSize = int(args.embSize)
 n_Samples = int(args.data)
-model_path = './saved-models/qp_' + args.type + '_d' + str(n_Samples) + '_s' + str(embSize) + '.pkl'
+model_path = '/home/halit/GNN-QP/saved-models/qp_' + args.type + '_d' + str(n_Samples) + '_s' + str(embSize) + '.pkl'
+
+# Part 2 of QP GNN testing script
+# This script should be run after test_qp_model_part1.py
 
 ## LOAD DATASET INTO MEMORY
 if args.type == "fea":
@@ -122,13 +125,19 @@ with tf.device("GPU:"+str(gpu_index)):
 
     ### LOAD MODEL ###
     if args.type == "sol":
-        model = QPGNNPolicy(embSize, nConsF, nEdgeF, nVarF, nQEdgeF, isGraphLevel=False)
+        model = QPGNNPolicy(embSize, nConsF, nEdgeF, nVarF, nQEdgeF, isGraphLevel=False, dropout_rate=0.0)
     else:
-        model = QPGNNPolicy(embSize, nConsF, nEdgeF, nVarF, nQEdgeF)
+        model = QPGNNPolicy(embSize, nConsF, nEdgeF, nVarF, nQEdgeF, dropout_rate=0.0)
     
     model.restore_state(model_path)
 
+    # Build the model by calling it once with sample input (fixes summary() error)
+    _ = model((conFeatures, edgIndices, edgFeatures, varFeatures, qedgIndices, qedgFeatures, n_Cons, n_Vars, n_Cons_small, n_Vars_small), training=False)
+
     ### TEST MODEL ###
     err = process(model, data, type=args.type, loss=args.loss, n_Vars_small=n_Vars_small)
-    model.summary()
+    try:
+        model.summary()
+    except ValueError as e:
+        print(f"Warning: model.summary() failed: {e}")
     print(f"MODEL: {model_path}, DATA-SET: {datafolder}, NUM-DATA: {n_Samples_test}, LOSS: {args.loss}, ERR: {err}")
